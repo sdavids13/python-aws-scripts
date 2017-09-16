@@ -8,53 +8,57 @@ import datetime
 
 s3_resource = boto3.resource('s3')
 s3_client = boto3.client('s3')
-queue = boto3.resource('sqs').get_queue_by_name(QueueName='sdavids-bucket-create-events')
 
 
-def _get_iso_date():
-    return datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+class LandingZoneProcessor:
 
+    def __init__(self):
+        self.queue = boto3.resource('sqs').get_queue_by_name(QueueName='sdavids-bucket-create-events')
 
-def _upload_random_files_to_s3():
-    for i in range(random.randint(0, 12)):
-        random_uuid = str(uuid.uuid4())
-        content = 'Key: {}, generated in iteration cycle {}'.format(random_uuid, i)
-        s3_resource.Object('sdavids', random_uuid + '.txt').put(
-            Body=content.encode('utf-8'), Tagging=urllib.parse.urlencode({'inserted': _get_iso_date()})
-        )
+    def read_s3_messages(self):
+        """Reads S3 insertion messages from SQS, continues to read until no messages are remaining on the queue"""
+        while True:
+            messages = self.queue.receive_messages(MaxNumberOfMessages=10, VisibilityTimeout=120, WaitTimeSeconds=5)
+            if len(messages) == 0:
+                break
 
+            for message in messages:
+                body = json.loads(message.body)
+                if 'Records' not in body:
+                    print('Bad SQS message body detected going to delete: {}'.format(body))
+                    message.delete()
+                    continue
 
-def read_s3_messages():
-    """Reads S3 insertion messages from SQS, continues to read until no messages are remaining on the queue"""
-    while True:
-        messages = queue.receive_messages(MaxNumberOfMessages=10, VisibilityTimeout=120, WaitTimeSeconds=5)
-        if len(messages) == 0:
-            break
+                for record in body['Records']:
+                    s3_record = record['s3']
+                    file = s3_resource.Object(s3_record['bucket']['name'], s3_record['object']['key'])
+                    tags = s3_client.get_object_tagging(Bucket=file.bucket_name, Key=file.key)['TagSet']
+                    print('File uploaded: {} with tags: {}'.format(file, tags))
 
-        for message in messages:
-            body = json.loads(message.body)
-            if 'Records' not in body:
-                print('Bad SQS message body detected going to delete: {}'.format(body))
-                message.delete()
-                continue
+                    file_content = file.get()['Body'].read().decode('utf-8')
+                    print('Downloaded file contents: {}'.format(file_content))
 
-            for record in body['Records']:
-                s3_record = record['s3']
-                file = s3_resource.Object(s3_record['bucket']['name'], s3_record['object']['key'])
-                tags = s3_client.get_object_tagging(Bucket=file.bucket_name, Key=file.key)['TagSet']
-                print('File uploaded: {} with tags: {}'.format(file, tags))
+                    print("Tagging object with the processed date/time.")
+                    tags.append({'Key': 'processed', 'Value': self.get_iso_date()})
+                    s3_client.put_object_tagging(Bucket=file.bucket_name, Key=file.key, Tagging={'TagSet': tags})
 
-                file_content = file.get()['Body'].read().decode('utf-8')
-                print('Downloaded file contents: {}'.format(file_content))
+                    print('Acknowledging SQS message')
+                    message.delete()
 
-                print("Tagging object with the processed date/time.")
-                tags.append({'Key': 'processed', 'Value': _get_iso_date()})
-                s3_client.put_object_tagging(Bucket=file.bucket_name, Key=file.key, Tagging={'TagSet': tags})
+    @staticmethod
+    def get_iso_date():
+        return datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
-                print('Acknowledging SQS message')
-                message.delete()
+    def _upload_random_files_to_s3(self):
+        for i in range(random.randint(0, 12)):
+            random_uuid = str(uuid.uuid4())
+            content = 'Key: {}, generated in iteration cycle {}'.format(random_uuid, i)
+            s3_resource.Object('sdavids', random_uuid + '.txt').put(
+                Body=content.encode('utf-8'), Tagging=urllib.parse.urlencode({'inserted': self.get_iso_date()})
+            )
 
 
 if __name__ == "__main__":
-    _upload_random_files_to_s3()
-    read_s3_messages()
+    lz = LandingZoneProcessor()
+    #lz._upload_random_files_to_s3()
+    lz.read_s3_messages()
